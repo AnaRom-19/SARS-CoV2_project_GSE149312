@@ -1,0 +1,1226 @@
+---
+title: "SARS_project"
+author: "Group 11"
+date: "2024-09-15"
+output: html_document
+theme: united
+toc: true
+editor_options: 
+  chunk_output_type: inline
+---
+
+# Setup
+
+```{r, echo=FALSE, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+#if (!require("BiocManager", quietly = TRUE))
+    #install.packages("BiocManager")
+
+#iocManager::install("tximport")
+library (tximport)
+
+#BiocManager::install("txdbmaker")
+library (txdbmaker)
+
+library(GenomicFeatures)
+library(AnnotationDbi)
+library (BiocIO)
+
+#if (!requireNamespace("rtracklayer", quietly = TRUE))
+   # BiocManager::install("rtracklayer")
+library(rtracklayer)
+
+if (!requireNamespace("org.Hs.eg.db", quietly = TRUE)) {
+    BiocManager::install("org.Hs.eg.db")
+}
+library(org.Hs.eg.db)
+
+library(stringr)
+
+#BiocManager::install("biomaRt")
+library(biomaRt)
+library(data.table)
+
+library(enrichR)
+
+library(PCAtools)
+library(DESeq2)
+library(tidyverse)
+library(plotly)
+library (ashr)
+
+library(DT)
+
+#BiocManager::install("DEGreport")
+library(DEGreport)
+
+library(pheatmap)
+library(ggplot2)
+library(EnhancedVolcano)
+library(plotly)
+library(ggrepel)
+library(gprofiler2)
+library(cowplot)
+
+library (janitor)
+library (clusterProfiler)
+library (enrichplot)
+library (stats)
+
+library (pathview)
+library (STRINGdb)
+library (igraph)
+library (ggraph)
+
+installed_packages <- installed.packages()[names(sessionInfo()$otherPkgs), "Version"]
+installed_packages <- data.frame(names(installed_packages), installed_packages)
+r_version <- c("R", strsplit(R.Version()[['version.string']], ' ')[[1]][3])
+installed_packages <- rbind(r_version, installed_packages)
+rownames(installed_packages) <- NULL
+colnames(installed_packages) <- c("Package", "Version")
+```
+
+```{r, echo=FALSE}
+datatable(installed_packages, extensions = "Buttons", options = list(dom = 'Blfrtip',
+                           buttons = c('copy', 'csv', 'excel', 'pdf', 'print')))
+```
+
+
+
+# Preparing metadata
+
+```{r, echo=FALSE}
+sampleTable <- read.csv("metadata_SARS.csv", row.names = 1)
+
+datatable(sampleTable, extensions = "Buttons", options = list(dom = 'Blfrtip',
+                           buttons = c('copy', 'csv', 'excel', 'pdf', 'print')))
+```
+
+
+
+# Preparing annotation file
+
+```{r}
+# https://www.gencodegenes.org/human/release_46.html (comprehensive gene annotation, CHR)
+gtf_file <- "gencode.v46.annotation.gtf"
+txdb <- makeTxDbFromGFF(gtf_file, format = "gtf")
+
+tx2gene <- AnnotationDbi::select(txdb, keys = keys(txdb, "TXNAME"),
+                  columns = c("TXNAME", "GENEID"),
+                  keytype = "TXNAME")
+
+colnames(tx2gene) <- c("tx_id", "gene_id")
+```
+
+
+
+# Loading kallisto files
+
+```{r}
+dir <- "kallisto"
+files <- list.files(path = dir, pattern = "abundance.tsv.gz", full.names = TRUE)
+sample_names <- basename(files)
+
+txi.kallisto <- tximport(files, type = "kallisto", tx2gene = tx2gene, ignoreAfterBar = TRUE)
+
+#changing IDs to gene names
+ens_ids <- rownames(txi.kallisto$counts)
+ens_ids_clean <- str_remove(ens_ids, "\\..*$")
+
+gene_names <- mapIds(org.Hs.eg.db, keys = ens_ids_clean, column = "SYMBOL", keytype = "ENSEMBL", multiVals = "first")
+gene_names_all <- ifelse(is.na(gene_names), ens_ids_clean, gene_names)
+
+rownames(txi.kallisto$counts) <- gene_names_all
+```
+
+
+```{r}
+counts_matrix <- as.matrix(txi.kallisto$counts)
+dim(counts_matrix)
+colnames(counts_matrix)<-rownames(sampleTable)
+```
+
+
+```{r, echo = FALSE, include=FALSE}
+duplicate_row_names <- rownames(counts_matrix)[duplicated(rownames(counts_matrix))]
+length (duplicate_row_names)
+
+counts_matrix_df <- as.data.frame(counts_matrix)
+aggregated_matrix <- counts_matrix_df %>% rownames_to_column(var = "Gene") %>% group_by(Gene) %>%  summarise(across(everything(), sum)) %>% column_to_rownames(var = "Gene")
+
+duplicate_row_names_aggregated <- rownames(aggregated_matrix)[duplicated(rownames(aggregated_matrix))]
+length (duplicate_row_names_aggregated)
+```
+
+
+
+# DE analysis with DESeq2
+
+```{r}
+dds_SARSCoV2 <- DESeqDataSetFromTximport (txi.kallisto, colData=sampleTable, design= ~ SARS_CoV2_time)
+
+dds_SARSCoV2_done <- DESeq(dds_SARSCoV2)
+dim (dds_SARSCoV2_done)
+
+dds_SARSCoV2_vst <- vst(dds_SARSCoV2, blind = TRUE)
+
+saveRDS(dds_SARSCoV2, "dds_SARSCoV2.rds")
+saveRDS(dds_SARSCoV2_done, "dds_SARSCoV2_done.rds")
+saveRDS(dds_SARSCoV2_vst, "dds_SARSCoV2_vst.rds")
+
+dds_SARSCoV2 <- readRDS("dds_SARSCoV2.rds")
+dds_SARSCoV2_vst <- readRDS("dds_SARSCoV2_vst.rds")
+dds_SARSCoV2_done <- readRDS("dds_SARSCoV2_done.rds")
+
+counts_SARS_vst <- assay(dds_SARSCoV2_vst) %>% as.data.frame()
+
+matrix_SARS_correlations <- cor(counts_SARS_vst)
+```
+
+
+
+# DE analysis with DESeq2: filtered counts (>50)
+
+```{r}
+keep_counts <- rowMeans(counts(dds_SARSCoV2)) >= 50
+dds_SARSCoV2_keep <- dds_SARSCoV2[keep_counts, ]
+
+dds_SARSCoV2_keep_done <- DESeq(dds_SARSCoV2_keep)
+dim (dds_SARSCoV2_keep_done)
+
+dds_SARSCoV2_keep_vst <- vst(dds_SARSCoV2_keep, blind = TRUE)
+
+saveRDS(dds_SARSCoV2_keep, "dds_SARSCoV2_keep.rds")
+saveRDS(dds_SARSCoV2_keep_done, "dds_SARSCoV2_keep_done.rds")
+saveRDS(dds_SARSCoV2_keep_vst, "dds_SARSCoV2_keep_vst.rds")
+
+dds_SARSCoV2_keep <- readRDS("dds_SARSCoV2_keep.rds")
+dds_SARSCoV2_keep_vst <- readRDS("dds_SARSCoV2_keep_vst.rds")
+dds_SARSCoV2_keep_done <- readRDS("dds_SARSCoV2_keep_done.rds")
+
+counts_SARS_keep_vst <- assay(dds_SARSCoV2_keep_vst) %>% as.data.frame()
+
+matrix_SARS_keep_correlations <- cor(counts_SARS_keep_vst)
+```
+
+
+
+# PCA and visualization
+
+```{r}
+plotPCA (dds_SARSCoV2_keep_vst, intgroup = c("SARS_CoV2_time")) + 
+  geom_label_repel(aes(label = name)) + 
+  theme_bw()
+```
+
+
+
+# Sample correlation heatmap
+
+```{r}
+pheatmap (matrix_SARS_keep_correlations, annotation = sampleTable, show_rownames = TRUE, show_colnames = TRUE)
+```
+
+
+
+# Pairwise comparison
+
+## 0h vs 24 h
+
+```{r}
+res_0_24 <- results(dds_SARSCoV2_done, contrast = c("SARS_CoV2_time", "24h", "0h"))
+res_0_24 <- res_0_24 %>% as.data.frame() %>% filter(abs(log2FoldChange) > 1.5, padj < 0.05) %>% arrange(desc(log2FoldChange))
+```
+
+```{r, echo = FALSE}
+datatable(res_0_24, extensions = "Buttons", options = list(dom = 'Blfrtip', buttons = c('copy', 'csv', 'excel', 'pdf', 'print')))
+```
+
+
+## 0h vs 24 h: ashr
+
+```{r}
+res_0_24_ashr <- lfcShrink(dds_SARSCoV2_done, type="ashr", contrast = c("SARS_CoV2_time", "24h", "0h"))
+res_0_24_ashr <- res_0_24_ashr %>% as.data.frame() %>% filter(abs(log2FoldChange) > 1.5, padj < 0.05) %>% arrange(desc(log2FoldChange))
+```
+
+
+```{r, echo=FALSE}
+datatable(res_0_24_ashr, extensions = "Buttons", options = list(dom = 'Blfrtip', buttons = c('copy', 'csv', 'excel', 'pdf', 'print')))
+```
+
+
+## 0h vs 24 h: ashr (filtered counts)
+
+```{r}
+res_0_24_keep_ashr <- lfcShrink(dds_SARSCoV2_keep_done, type="ashr", contrast = c("SARS_CoV2_time", "24h", "0h"))
+res_0_24_keep_ashr <- res_0_24_keep_ashr %>% as.data.frame() %>% filter(abs(log2FoldChange) > 1.5, padj < 0.05) %>% arrange(desc(log2FoldChange))
+```
+
+
+```{r, echo = FALSE}
+datatable(res_0_24_keep_ashr, extensions = "Buttons", options = list(dom = 'Blfrtip', buttons = c('copy', 'csv', 'excel', 'pdf', 'print')))
+```
+
+## 0h vs 60h
+
+```{r}
+res_0_60 <- results(dds_SARSCoV2_done, contrast = c("SARS_CoV2_time", "60h", "0h"))
+res_0_60 <- res_0_60 %>% as.data.frame() %>% filter(abs(log2FoldChange) > 1.5, padj < 0.05) %>% arrange(desc(log2FoldChange))
+```
+
+```{r, echo = FALSE}
+datatable(res_0_60, extensions = "Buttons", options = list(dom = 'Blfrtip', buttons = c('copy', 'csv', 'excel', 'pdf', 'print')))
+```
+
+
+## 0h vs 60h: ashr
+
+```{r}
+res_0_60_ashr <- lfcShrink(dds_SARSCoV2_done, type = "ashr", contrast = c("SARS_CoV2_time", "60h", "0h"))
+res_0_60_ashr <- res_0_60_ashr %>% as.data.frame() %>% filter(abs(log2FoldChange) > 1.5, padj < 0.05) %>% arrange(desc(log2FoldChange))
+```
+
+```{r, echo = FALSE}
+datatable(res_0_60_ashr, extensions = "Buttons", options = list(dom = 'Blfrtip', buttons = c('copy', 'csv', 'excel', 'pdf', 'print')))
+```
+
+
+## 0h vs 60h: ashr (filtered counts)
+
+```{r}
+res_0_60_keep_ashr <- lfcShrink(dds_SARSCoV2_keep_done, type = "ashr", contrast = c("SARS_CoV2_time", "60h", "0h"))
+res_0_60_keep_ashr <- res_0_60_keep_ashr %>% as.data.frame() %>% filter(abs(log2FoldChange) > 1.5, padj < 0.05) %>% arrange(desc(log2FoldChange))
+```
+
+```{r, echo = FALSE}
+datatable(res_0_60_keep_ashr, extensions = "Buttons", options = list(dom = 'Blfrtip', buttons = c('copy', 'csv', 'excel', 'pdf', 'print')))
+```
+
+
+## 24h vs 60h
+
+```{r}
+res_24_60 <- results(dds_SARSCoV2_done, contrast = c("SARS_CoV2_time", "60h", "24h"))
+res_24_60 <- res_24_60 %>% as.data.frame() %>% filter(abs(log2FoldChange) > 1.5, padj < 0.05) %>% arrange(desc(log2FoldChange))
+```
+
+```{r, echo = FALSE}
+datatable(res_24_60, extensions = "Buttons", options = list(dom = 'Blfrtip', buttons = c('copy', 'csv', 'excel', 'pdf', 'print')))
+```
+
+
+## 24h vs 60h: ashr
+
+```{r}
+res_24_60_ashr <- lfcShrink(dds_SARSCoV2_done, type= "ashr", contrast = c("SARS_CoV2_time", "60h", "24h"))
+res_24_60_ashr <- res_24_60_ashr %>% as.data.frame() %>% filter(abs(log2FoldChange) > 1.5, padj < 0.05) %>% arrange(desc(log2FoldChange))
+```
+
+```{r, echo = FALSE}
+datatable(res_24_60_ashr, extensions = "Buttons", options = list(dom = 'Blfrtip', buttons = c('copy', 'csv', 'excel', 'pdf', 'print')))
+```
+
+
+## 24h vs 60h: ashr (filtered counts)
+
+```{r}
+res_24_60_keep_ashr <- lfcShrink(dds_SARSCoV2_keep_done, type= "ashr", contrast = c("SARS_CoV2_time", "60h", "24h"))
+res_24_60_keep_ashr <- res_24_60_keep_ashr %>% as.data.frame() %>% filter(abs(log2FoldChange) > 1.5, padj < 0.05) %>% arrange(desc(log2FoldChange))
+```
+
+```{r, echo = FALSE}
+datatable(res_24_60_keep_ashr, extensions = "Buttons", options = list(dom = 'Blfrtip', buttons = c('copy', 'csv', 'excel', 'pdf', 'print')))
+```
+
+
+## Summary table for DEGs
+
+```{r}
+degs <- function(res) {
+  upregulated <- sum(res$log2FoldChange > 1.5, na.rm = TRUE)
+  downregulated <- sum(res$log2FoldChange < -1.5, na.rm = TRUE)
+  
+  return(c(up = upregulated, down = downregulated))
+}
+```
+
+
+```{r}
+count_degs_0_24 <- degs (res_0_24)
+count_degs_0_24_ashr <- degs (res_0_24_ashr)
+count_degs_0_24_keep_ashr <- degs (res_0_24_keep_ashr)
+
+count_degs_0_60 <- degs (res_0_60)
+count_degs_0_60_ashr <- degs (res_0_60_ashr)
+count_degs_0_60_keep_ashr <- degs (res_0_60_keep_ashr)
+
+count_degs_24_60 <- degs (res_24_60)
+count_degs_24_60_ashr <- degs (res_24_60_ashr)
+count_degs_24_60_keep_ashr <- degs (res_24_60_keep_ashr)
+```
+
+
+```{r}
+summary_degs <- data.frame(
+  
+  Experiment = c ("0h vs 24h", "0h vs 24h (ashr)", "0h vs 24h (ashr, filtered counts)", "0h vs 60h", "0h vs 60h (ashr)", "0h vs 60h (ashr, filtered counts)", "24h vs 60h", "24h vs 60h (ashr)", "24h vs 60h (ashr, filtered counts)"),
+  
+  up_DEGs = c (count_degs_0_24["up"], count_degs_0_24_ashr["up"], count_degs_0_24_keep_ashr["up"], count_degs_0_60["up"], count_degs_0_60_ashr["up"], count_degs_0_60_keep_ashr["up"], count_degs_24_60["up"], count_degs_24_60_ashr["up"], count_degs_24_60_keep_ashr["up"]),
+ 
+  down_DEGs = c (count_degs_0_24["down"], count_degs_0_24_ashr["down"], count_degs_0_24_keep_ashr["down"], count_degs_0_60["down"], count_degs_0_60_ashr["down"], count_degs_0_60_keep_ashr["down"], count_degs_24_60["down"], count_degs_24_60_ashr["down"], count_degs_24_60_keep_ashr["down"])
+)
+
+summary_degs <- summary_degs %>% dplyr::mutate (total_DEGs = up_DEGs + down_DEGs)
+```
+
+
+```{r, echo = FALSE}
+datatable(summary_degs, extensions = "Buttons", options = list(dom = 'Blfrtip', buttons = c('copy', 'csv', 'excel', 'pdf', 'print')))
+```
+
+
+
+# Multigroup testing: LRT 
+
+```{r}
+lrt <- DESeq(dds_SARSCoV2_done, test = "LRT", reduced = ~1)
+res_lrt_sars <- results(lrt)
+res_lrt_sars_signif <- res_lrt_sars %>% as.data.frame() %>% filter(padj < 0.05) %>% arrange(padj)
+```
+
+```{r, echo = FALSE}
+datatable(res_lrt_sars_signif, extensions = "Buttons", options = list(dom = 'Blfrtip', buttons = c('copy', 'csv', 'excel', 'pdf', 'print')))
+```
+
+
+```{r, include=FALSE}
+lrt_preprocessed <- assay(dds_SARSCoV2_done)[rownames(res_lrt_sars_signif), ]
+dim(lrt_preprocessed)
+
+vst_normalized_lrt_sars <- varianceStabilizingTransformation (lrt_preprocessed)
+
+normalized_lrt_scaled <- t(scale(t(vst_normalized_lrt_sars)))
+```
+
+
+# Multigroup testing: LRT (filtered counts)
+
+```{r}
+lrt_keep <- DESeq(dds_SARSCoV2_keep_done, test = "LRT", reduced = ~1)
+res_lrt_sars_keep <- results(lrt_keep)
+res_lrt_sars_keep_signif <- res_lrt_sars_keep %>% as.data.frame() %>% filter(padj < 0.05) %>% arrange(padj)
+```
+
+```{r, echo = FALSE}
+datatable(res_lrt_sars_keep_signif, extensions = "Buttons", options = list(dom = 'Blfrtip', buttons = c('copy', 'csv', 'excel', 'pdf', 'print')))
+```
+
+
+```{r, include=FALSE}
+lrt_keep_preprocessed <- assay(dds_SARSCoV2_keep_done)[rownames(res_lrt_sars_keep_signif), ]
+dim(lrt_keep_preprocessed)
+
+vst_normalized_lrt_keep_sars <- varianceStabilizingTransformation (lrt_keep_preprocessed)
+
+normalized_lrt_keep_scaled <- t(scale(t(vst_normalized_lrt_keep_sars)))
+```
+
+
+
+# DEGreport: clusters
+
+```{r}
+sampleTable$SARS_CoV2_time <- as.factor(sampleTable$SARS_CoV2_time)
+
+clusters <- degPatterns(vst_normalized_lrt_sars, metadata = sampleTable, 
+                        time = "SARS_CoV2_time", , col = NULL)
+```
+
+```{r, echo=FALSE, include=FALSE}
+clusters_genes <- clusters$df
+clusters_genes %>% arrange(cluster)
+clusters_genes
+```
+
+
+# DEGreport: clusters (filtered counts)
+
+```{r}
+sampleTable$SARS_CoV2_time <- as.factor(sampleTable$SARS_CoV2_time)
+
+clusters_keep <- degPatterns(vst_normalized_lrt_keep_sars, metadata = sampleTable, 
+                        time = "SARS_CoV2_time", , col = NULL)
+```
+
+
+```{r, echo=FALSE, include=FALSE}
+clusters_keep_genes <- clusters_keep$df
+clusters_keep_genes %>% arrange(cluster)
+clusters_keep_genes
+```
+
+
+
+# Volcano plots
+
+## 0h vs 24h
+
+```{r}
+res_0_24_genes <- results(dds_SARSCoV2_done, contrast = c("SARS_CoV2_time", "24h", "0h")) %>% as.data.frame() %>% tibble::rownames_to_column("gene")
+
+volcano_df_0_24 <- res_0_24_genes
+
+EnhancedVolcano (volcano_df_0_24,
+                lab = volcano_df_0_24$gene,
+                x = "log2FoldChange",
+                y = "padj",
+                title = "SARS-CoV2 0h vs SARS-CoV2 24h",
+                pCutoff = 0.01,
+                FCcutoff = 1.5,
+                ylim = c(0,10), labSize = 2.5) +
+  theme_minimal()
+```
+
+## 0h vs 24h: ashr
+
+```{r}
+res_0_24_ashr_genes <- lfcShrink(dds_SARSCoV2_done, type="ashr", contrast = c("SARS_CoV2_time", "24h", "0h")) %>% as.data.frame() %>%   tibble::rownames_to_column("gene")
+
+volcano_df_0_24_ashr <- res_0_24_ashr_genes
+
+EnhancedVolcano (volcano_df_0_24_ashr,
+                lab = volcano_df_0_24_ashr$gene,
+                x = "log2FoldChange",
+                y = "padj",
+                title = "SARS-CoV2 0h vs SARS-CoV2 24h (ashr)",
+                pCutoff = 0.01,
+                FCcutoff = 1.5,
+                ylim = c(0,10), labSize = 2.5) +
+  theme_minimal()
+```
+
+
+## 0h vs 24h: ashr (filtered counts)
+
+```{r}
+res_0_24_keep_ashr_genes <- lfcShrink(dds_SARSCoV2_keep_done, type="ashr", contrast = c("SARS_CoV2_time", "24h", "0h")) %>% as.data.frame() %>% tibble::rownames_to_column("gene")
+
+volcano_df_0_24_keep_ashr <- res_0_24_keep_ashr_genes
+
+EnhancedVolcano (volcano_df_0_24_keep_ashr,
+                lab = volcano_df_0_24_keep_ashr$gene,
+                x = "log2FoldChange",
+                y = "padj",
+                title = "SARS-CoV2 0h vs SARS-CoV2 24h (ashr)",
+                pCutoff = 0.01,
+                FCcutoff = 1.5,
+                ylim = c(0,10), labSize = 2.5) +
+  theme_minimal()
+```
+
+## 0h vs 60h
+
+```{r}
+res_0_60_genes <- results(dds_SARSCoV2_done, contrast = c("SARS_CoV2_time", "60h", "0h")) %>% as.data.frame() %>% tibble::rownames_to_column("gene")
+
+volcano_df_0_60 <- res_0_60_genes
+
+EnhancedVolcano (volcano_df_0_60,
+                lab = volcano_df_0_60$gene,
+                x = "log2FoldChange",
+                y = "padj",
+                title = "SARS-CoV2 0h vs SARS-CoV2 60h",
+                pCutoff = 0.01,
+                FCcutoff = 1.5,
+                ylim = c(0,10), labSize = 2.5) +
+  theme_minimal()
+```
+
+
+## 0h vs 60h: ashr
+
+```{r,}
+res_0_60_ashr_genes <- lfcShrink(dds_SARSCoV2_done, type="ashr", contrast = c("SARS_CoV2_time", "60h", "0h")) %>% as.data.frame() %>%   tibble::rownames_to_column("gene")
+
+volcano_df_0_60_ashr <- res_0_60_ashr_genes
+
+EnhancedVolcano (volcano_df_0_60_ashr,
+                lab = volcano_df_0_60_ashr$gene,
+                x = "log2FoldChange",
+                y = "padj",
+                title = "SARS-CoV2 0h vs SARS-CoV2 60h (ashr)",
+                pCutoff = 0.01,
+                FCcutoff = 1.5,
+                ylim = c(0,10), labSize = 2.5) +
+  theme_minimal()
+```
+
+
+## 0h vs 60h: ashr (filtered counts)
+
+```{r}
+res_0_60_keep_ashr_genes <- lfcShrink(dds_SARSCoV2_keep_done, type="ashr", contrast = c("SARS_CoV2_time", "60h", "0h")) %>% as.data.frame() %>% tibble::rownames_to_column("gene")
+
+volcano_df_0_60_keep_ashr <- res_0_60_keep_ashr_genes
+
+EnhancedVolcano (volcano_df_0_60_keep_ashr,
+                lab = volcano_df_0_60_keep_ashr$gene,
+                x = "log2FoldChange",
+                y = "padj",
+                title = "SARS-CoV2 0h vs SARS-CoV2 60h (ashr)",
+                pCutoff = 0.01,
+                FCcutoff = 1.5,
+                ylim = c(0,10), labSize = 2.5) +
+  theme_minimal()
+```
+
+
+## 24h vs 60h
+
+```{r}
+res_24_60_genes <- results(dds_SARSCoV2_done, contrast = c("SARS_CoV2_time", "60h", "24h")) %>% as.data.frame() %>% tibble::rownames_to_column("gene")
+
+volcano_df_24_60 <- res_24_60_genes
+
+EnhancedVolcano (volcano_df_24_60,
+                lab = volcano_df_24_60$gene,
+                x = "log2FoldChange",
+                y = "padj",
+                title = "SARS-CoV2 24h vs SARS-CoV2 60h",
+                pCutoff = 0.01,
+                FCcutoff = 1.5,
+                ylim = c(0,10), labSize = 2.5) +
+  theme_minimal()
+```
+
+
+
+## 24h vs 60h: ashr
+
+```{r}
+res_24_60_ashr_genes <- lfcShrink(dds_SARSCoV2_done, type = "ashr", contrast = c("SARS_CoV2_time", "60h", "24h")) %>% as.data.frame() %>% tibble::rownames_to_column("gene")
+
+volcano_df_24_60_ashr <- res_24_60_ashr_genes
+
+EnhancedVolcano (volcano_df_24_60_ashr,
+                lab = volcano_df_24_60_ashr$gene,
+                x = "log2FoldChange",
+                y = "padj",
+                title = "SARS-CoV2 24h vs SARS-CoV2 60h (ashr)",
+                pCutoff = 0.01,
+                FCcutoff = 1.5,
+                ylim = c(0,10), labSize = 2.5) +
+  theme_minimal()
+```
+
+
+## 24h vs 60h: ashr (filtered counts)
+
+```{r}
+res_24_60_keep_ashr_genes <- lfcShrink(dds_SARSCoV2_keep_done, type = "ashr", contrast = c("SARS_CoV2_time", "60h", "24h")) %>% as.data.frame() %>%   tibble::rownames_to_column("gene")
+
+volcano_df_24_60_keep_ashr <- res_24_60_keep_ashr_genes
+
+EnhancedVolcano (volcano_df_24_60_keep_ashr,
+                lab = volcano_df_24_60_keep_ashr$gene,
+                x = "log2FoldChange",
+                y = "padj",
+                title = "SARS-CoV2 24h vs SARS-CoV2 60h (ashr)",
+                pCutoff = 0.01,
+                FCcutoff = 1.5,
+                ylim = c(0,10), labSize = 2.5) +
+  theme_minimal()
+```
+
+
+
+# Interactive volcano plots (ggplotly)
+
+## 0h vs 24h
+
+```{r, echo=FALSE, warning = FALSE}
+
+res_0_24_keep_ashr_ordered <- res_0_24_keep_ashr_genes[order(res_0_24_keep_ashr_genes$padj),]
+
+res_0_24_keep_ashr_top <- res_0_24_keep_ashr_ordered[1:1000,] 
+
+res_0_24_keep_ashr_top$diff_expressed <- ifelse(res_0_24_keep_ashr_top$log2FoldChange > 1.5, "UP", ifelse(res_0_24_keep_ashr_top$log2FoldChange < -1.5, "DOWN", "NO"))
+
+res_0_24_keep_ashr_top$diff_expressed <- as.factor(res_0_24_keep_ashr_top$diff_expressed)
+
+vlcnplt <- ggplot(data = res_0_24_keep_ashr_top, aes(x=log2FoldChange, y=-log10(padj), col = diff_expressed, label = gene)) +
+  geom_point() +
+  theme_minimal() +
+  scale_color_manual(values = c("blue", "black", "maroon")) + 
+  labs(title = "SARS-CoV2 0h vs SARS-CoV2 24h") +
+  geom_text_repel() +
+  geom_vline(xintercept = c(-1.5, 1.5), col = "black") + 
+  geom_hline(yintercept = -log10(0.01), col = "black")
+
+ggplotly(vlcnplt)
+```
+
+
+## 0h vs 60h
+
+```{r, echo=FALSE, warning = FALSE}
+res_0_60_keep_ashr_ordered <- res_0_60_keep_ashr_genes[order(res_0_60_keep_ashr_genes$padj),]
+
+res_0_60_keep_ashr_top <- res_0_60_keep_ashr_ordered[1:1000,] 
+
+res_0_60_keep_ashr_top$diff_expressed <- ifelse(res_0_60_keep_ashr_top$log2FoldChange > 1.5, "UP", ifelse(res_0_60_keep_ashr_top$log2FoldChange < -1.5, "DOWN", "NO"))
+
+res_0_60_keep_ashr_top$diff_expressed <- as.factor(res_0_60_keep_ashr_top$diff_expressed)
+
+vlcnplt <- ggplot(data = res_0_60_keep_ashr_top, aes(x=log2FoldChange, y=-log10(padj), col = diff_expressed, label = gene)) +
+  geom_point() +
+  theme_minimal() +
+  scale_color_manual(values = c("blue", "black", "maroon")) + 
+  labs(title = "SARS-CoV2 0h vs SARS-CoV2 60h") +
+  geom_text_repel() +
+  geom_vline(xintercept = c(-1.5, 1.5), col = "black") + 
+  geom_hline(yintercept = -log10(0.01), col = "black")
+
+ggplotly(vlcnplt)
+```
+
+
+## 24h vs 60h
+
+```{r, echo=FALSE, warning = FALSE}
+res_24_60_keep_ashr_ordered <- res_24_60_keep_ashr_genes[order(res_24_60_keep_ashr_genes$padj),]
+
+res_24_60_keep_ashr_top <- res_24_60_keep_ashr_ordered[1:1000,] 
+
+res_24_60_keep_ashr_top$diff_expressed <- ifelse(res_24_60_keep_ashr_top$log2FoldChange > 1.5, "UP", ifelse(res_24_60_keep_ashr_top$log2FoldChange < -1.5, "DOWN", "NO"))
+
+res_24_60_keep_ashr_top$diff_expressed <- as.factor(res_24_60_keep_ashr_top$diff_expressed)
+
+vlcnplt <- ggplot(data = res_24_60_keep_ashr_top, aes(x=log2FoldChange, y=-log10(padj), col = diff_expressed, label = gene)) +
+  geom_point() +
+  theme_minimal() +
+  scale_color_manual(values = c("blue", "black", "maroon")) + 
+  labs(title = "SARS-CoV2 24h vs SARS-CoV2 60h") +
+  geom_text_repel() +
+  geom_vline(xintercept = c(-1.5, 1.5), col = "black") + 
+  geom_hline(yintercept = -log10(0.01), col = "black")
+
+ggplotly(vlcnplt)
+```
+
+
+
+# Heatmap
+
+```{r, echo=FALSE, include=FALSE}
+pheatmap(normalized_lrt_scaled, 
+         cluster_rows = TRUE, 
+         cluster_cols = TRUE,
+         show_rownames = FALSE,
+         annotation_col = as.data.frame(colData(dds_SARSCoV2_done)["SARS_CoV2_time"]))
+```
+
+```{r}
+# filtered counts (>50)
+pheatmap(normalized_lrt_keep_scaled, 
+         cluster_rows = TRUE, 
+         cluster_cols = TRUE,
+         show_rownames = FALSE,
+         annotation_col = as.data.frame(colData(dds_SARSCoV2_done)["SARS_CoV2_time"]))
+```
+
+
+```{r, echo=FALSE, include=FALSE}
+res_0_24_ashr_sign <- res_0_24_ashr %>% head(20)
+res_0_60_ashr_sign <- res_0_60_ashr %>% head(20)
+
+top_up_genes_sars <- unique(c(rownames(res_0_24_ashr_sign), rownames(res_0_60_ashr_sign)))
+
+top_counts_SARS_vst <- counts_SARS_vst [top_up_genes_sars, ]
+
+pheatmap(top_counts_SARS_vst, cluster_rows = TRUE, cluster_cols = TRUE, 
+         annotation_col = as.data.frame(colData(dds_SARSCoV2_done)["SARS_CoV2_time"]), fontsize_row = 6)
+```
+
+```{r}
+# filtered counts (>50)
+res_0_24_keep_ashr_sign <- res_0_24_keep_ashr %>% head(20)
+res_0_60_keep_ashr_sign <- res_0_60_keep_ashr %>% head(20)
+
+top_up_keep_genes_sars <- unique(c(rownames(res_0_24_keep_ashr_sign), rownames(res_0_60_keep_ashr_sign)))
+
+top_counts_SARS_keep_vst <- counts_SARS_keep_vst [top_up_keep_genes_sars, ]
+
+pheatmap(top_counts_SARS_keep_vst, cluster_rows = TRUE, cluster_cols = TRUE, 
+         annotation_col = as.data.frame(colData(dds_SARSCoV2_keep_done)["SARS_CoV2_time"]), fontsize_row = 6)
+```
+
+
+
+# Functional analysis
+
+## BioMart
+
+```{r}
+res_0_24_keep_ashr_FC <- res_0_24_keep_ashr[abs(res_0_24_keep_ashr$log2FoldChange)> 4,]
+
+genes_sars_keep_ashr <- unique(rownames(res_0_24_keep_ashr_FC))
+length(genes_sars_keep_ashr)
+genes_sars_keep_ashr
+```
+
+
+```{r}
+ensembl <- useEnsembl(biomart = "ensembl", dataset = "hsapiens_gene_ensembl")
+
+attributes_sars <- c("hgnc_symbol", "description", "gene_biotype", "phenotype_description")
+
+genes_BM <- getBM (filter="hgnc_symbol", attributes=attributes_sars, values=genes_sars_keep_ashr, mart=ensembl)
+```
+
+```{r, echo = FALSE}
+datatable(genes_BM, extensions = "Buttons", options = list(dom = 'Blfrtip',
+                           buttons = c('copy', 'csv', 'excel', 'pdf', 'print')))
+```
+
+
+
+## Overrepresentation: EnrichR
+
+```{r}
+de_results_sars_ashr_60up <- res_0_60_ashr %>% filter (log2FoldChange > 1.5)
+```
+
+```{r, echo = FALSE}
+datatable(de_results_sars_ashr_60up, extensions = "Buttons", options = list(dom = 'Blfrtip',
+                           buttons = c('copy', 'csv', 'excel', 'pdf', 'print')))
+```
+
+```{r}
+# filtered counts (>50)
+de_results_sars_keep_ashr_60up <- res_0_60_keep_ashr %>% filter (log2FoldChange > 1.5)
+```
+
+```{r, echo = FALSE}
+datatable(de_results_sars_keep_ashr_60up, extensions = "Buttons", options = list(dom = 'Blfrtip',
+                           buttons = c('copy', 'csv', 'excel', 'pdf', 'print')))
+```
+
+
+```{r, include=FALSE}
+dbs <- listEnrichrDbs()
+
+dbs <- c("WikiPathway_2021_Human", "Virus_Perturbations_from_GEO_up", "Reactome_2016", "COVID-19_Related_Gene_Sets_2021", "DisGeNET", "GO_Molecular_Function_2023", "GO_Biological_Process_2023", "DGIdb_Drug_Targets_2024")
+
+enriched_60sars_keep_up_ashr <- enrichr(rownames(de_results_sars_keep_ashr_60up), dbs)
+```
+
+
+```{r, echo=FALSE, include=FALSE}
+plot_enrichr_results_wikipath <- function(enrichr_results_sars, pval_threshold = 0.05, top_n = 10, fill_column = "Combined.Score") {
+
+  filtered_results <- enrichr_results_sars %>%
+    filter(Adjusted.P.value <= pval_threshold) %>%
+    arrange(Adjusted.P.value) %>%
+    head(top_n)
+  
+  p <- ggplot(filtered_results, aes(x = reorder(Term, -Adjusted.P.value), 
+                                    y = -log10(Adjusted.P.value), 
+                                    fill = !!sym(fill_column))) +
+    geom_bar(stat = "identity") +
+    scale_fill_gradient(low = "#00b1b1", high = "#9f0077") +
+    coord_flip() +
+    theme_minimal() +
+    labs(title = "Top Enrichment Terms: WikiPathway_2021_Human",
+         x = "Enrichment Term",
+         y = "-log10(Adjusted P-value)",
+         fill = fill_column) +
+    theme(axis.text = element_text(size = 12),
+          axis.title = element_text(size = 12),
+          plot.title = element_text(size = 14, face = "bold"))
+  
+  print(p)
+}
+```
+
+```{r, echo=FALSE, include=FALSE}
+plot_enrichr_results_bioproc <- function(enrichr_results_sars, pval_threshold = 0.05, top_n = 10, fill_column = "Combined.Score") {
+
+  filtered_results <- enrichr_results_sars %>%
+    filter(Adjusted.P.value <= pval_threshold) %>%
+    arrange(Adjusted.P.value) %>%
+    head(top_n)
+  
+  p <- ggplot(filtered_results, aes(x = reorder(Term, -Adjusted.P.value), 
+                                    y = -log10(Adjusted.P.value), 
+                                    fill = !!sym(fill_column))) +
+    geom_bar(stat = "identity") +
+    scale_fill_gradient(low = "#00b1b1", high = "#9f0077") +
+    coord_flip() +
+    theme_minimal() +
+    labs(title = "Top Enrichment Terms: GO_Biological_Process_2023",
+         x = "Enrichment Term",
+         y = "-log10(Adjusted P-value)",
+         fill = fill_column) +
+    theme(axis.text = element_text(size = 12),
+          axis.title = element_text(size = 12),
+          plot.title = element_text(size = 14, face = "bold"))
+  
+  print(p)
+}
+```
+
+```{r, echo=FALSE, include=FALSE}
+plot_enrichr_results_reactome <- function(enrichr_results_sars, pval_threshold = 0.05, top_n = 10, fill_column = "Combined.Score") {
+
+  filtered_results <- enrichr_results_sars %>%
+    filter(Adjusted.P.value <= pval_threshold) %>%
+    arrange(Adjusted.P.value) %>%
+    head(top_n)
+  
+  p <- ggplot(filtered_results, aes(x = reorder(Term, -Adjusted.P.value), 
+                                    y = -log10(Adjusted.P.value), 
+                                    fill = !!sym(fill_column))) +
+    geom_bar(stat = "identity") +
+    scale_fill_gradient(low = "#00b1b1", high = "#9f0077") +
+    coord_flip() +
+    theme_minimal() +
+    labs(title = "Top Enrichment Terms: Reactome_2016",
+         x = "Enrichment Term",
+         y = "-log10(Adjusted P-value)",
+         fill = fill_column) +
+    theme(axis.text = element_text(size = 12),
+          axis.title = element_text(size = 12),
+          plot.title = element_text(size = 14, face = "bold"))
+  
+  print(p)
+}
+```
+
+
+```{r, fig.width=12, fig.height=6}
+plot_enrichr_results_wikipath(enriched_60sars_keep_up_ashr$"WikiPathway_2021_Human")
+plot_enrichr_results_bioproc(enriched_60sars_keep_up_ashr$"GO_Biological_Process_2023")
+plot_enrichr_results_reactome(enriched_60sars_keep_up_ashr$"Reactome_2016")
+```
+
+
+
+## Overrepresentation: gProfiler
+
+```{r, include=FALSE}
+gostres_sars <- gost(query = rownames(de_results_sars_keep_ashr_60up),organism = "hsapiens",
+                                ordered_query = TRUE)
+
+gostres_sars$result
+```
+
+```{r}
+p_sars <- gostplot(gostres_sars, capped = FALSE, interactive = FALSE)
+p_sars
+```
+
+```{r}
+publish_gostplot(p_sars, highlight_terms = c("REAC:R-HSA-909733", "GO:0009615", "GO:0034340", "GO:0045071"))
+```
+
+
+
+## Ranking-based enrichment: GSEA
+
+```{r}
+res_0_60_ashr_rank <- res_0_60_ashr %>% mutate(ranking = (sign(log2FoldChange) * (-log10(pvalue)))) %>% 
+arrange(desc(ranking)) %>% tibble::rownames_to_column("genes")
+```
+
+```{r, echo = FALSE}
+datatable(res_0_60_ashr_rank, extensions = "Buttons", options = list(dom = 'Blfrtip',
+                           buttons = c('copy', 'csv', 'excel', 'pdf', 'print')))
+```
+
+
+```{r, include=FALSE}
+ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+
+gene_names_0_60_ashr_rank <- res_0_60_ashr_rank$genes[!grepl("^ENSG", res_0_60_ashr_rank$genes)]
+
+BM_mapped <- getBM(filters = "hgnc_symbol", 
+                      attributes = c("hgnc_symbol", "ensembl_gene_id"), 
+                      values = gene_names_0_60_ashr_rank, 
+                      mart = ensembl)
+
+name_to_ens_0_60_ashr_rank <- setNames(BM_mapped$ensembl_gene_id, BM_mapped$hgnc_symbol)
+
+res_0_60_ashr_rank$genes <- ifelse(grepl("^ENSG", res_0_60_ashr_rank$genes), 
+                                 res_0_60_ashr_rank$genes, 
+                                 name_to_ens_0_60_ashr_rank[res_0_60_ashr_rank$genes])
+
+res_0_60_ashr_rank <- res_0_60_ashr_rank %>% filter(!is.na(genes))
+res_0_60_ashr_rank
+```
+
+
+```{r, include=FALSE}
+genes_0_60_ashr_entrez <- getBM(filters = "ensembl_gene_id",
+             attributes = c("entrezgene_id", "ensembl_gene_id"),
+             values = res_0_60_ashr_rank$genes,
+             mart = ensembl)
+
+genes_0_60_ashr_entrez
+```
+
+
+```{r, include=FALSE}
+res_0_60_ashr_rank_joined <- dplyr::left_join(res_0_60_ashr_rank, genes_0_60_ashr_entrez, by = c("genes" = "ensembl_gene_id"))
+
+res_0_60_ashr_rank_joined
+```
+
+
+```{r, include=FALSE}
+res_0_60_ashr_rank_joined %>% janitor::get_dupes("entrezgene_id")
+
+res_0_60_ashr_rank_dropna <- res_0_60_ashr_rank_joined %>% tidyr::drop_na() %>% dplyr::distinct(entrezgene_id, .keep_all = TRUE)
+
+res_0_60_ashr_rank_dropna
+```
+
+
+```{r}
+genes_list_sars_ashr <- res_0_60_ashr_rank_dropna$ranking
+names(genes_list_sars_ashr) <- res_0_60_ashr_rank_dropna$entrezgene_id
+genes_list_sars_ashr = sort(genes_list_sars_ashr, decreasing = TRUE)
+```
+
+
+```{r}
+gseGO_sars <- gseGO (geneList = genes_list_sars_ashr, OrgDb ="org.Hs.eg.db", keyType = "ENTREZID", pvalueCutoff = 0.25)
+
+gseGO_sars
+```
+
+
+```{r}
+gseGO_sars_005 <- gseGO_sars %>% filter(p.adjust < 0.05)
+gseGO_sars_005
+```
+
+
+```{r}
+dotplot(gseGO_sars_005, showCategory = 15) + ggtitle("dotplot for GSEA (Padj < 0.05)") + theme (axis.text.y = element_text(size = 7))
+
+dotplot(gseGO_sars_005, showCategory = 15, x = "NES") + ggtitle("dotplot for GSEA (Padj < 0.05)") + theme (axis.text.y = element_text(size = 7))
+```
+
+
+```{r, echo=FALSE, include=FALSE}
+gseGO_sars_005_genename <- setReadable(gseGO_sars_005, 'org.Hs.eg.db', 'ENTREZID')
+
+
+p1_sars <- cnetplot(gseGO_sars_005_genename, color.params = list(foldChange = genes_list_sars_ashr))
+
+p2_sars <- cnetplot(gseGO_sars_005_genename, categorySize="pvalue", 
+               color.params = list(foldChange = genes_list_sars_ashr))
+
+p3_sars <- cnetplot(gseGO_sars_005_genename, 
+               color.params = list(foldChange = genes_list_sars_ashr), 
+               circular = TRUE, colorEdge = TRUE)
+```
+
+
+```{r, include=FALSE}
+p1_sars <- cnetplot(gseGO_sars_005_genename, node_label="category", cex_label_category = 0.6) 
+p2_sars <- cnetplot(gseGO_sars_005_genename, node_label="gene", cex_label_gene = 0.6)
+p3_sars <- cnetplot(gseGO_sars_005_genename, node_label="all", cex_label_category = 0.6, cex_label_gene = 0.6) 
+p4_sars <- cnetplot(gseGO_sars_005_genename, node_label="none", color_category='firebrick', color_gene='steelblue') 
+```
+
+```{r}
+cowplot::plot_grid(p1_sars, p2_sars, p3_sars, p4_sars, ncol=2, labels=LETTERS[1:4])
+```
+
+
+```{r}
+heatplot(gseGO_sars_005_genename, foldChange=genes_list_sars_ashr, showCategory=10)
+```
+
+
+```{r, fig.width=13, fig.height=6}
+tmp_sars <- pairwise_termsim(gseGO_sars_005_genename)
+treeplot(tmp_sars)
+```
+
+
+```{r, include=FALSE}
+emap_sars <- emapplot(tmp_sars, cex_label_category=0.8, cex_category = 1.5, layout="kk")
+```
+
+```{r}
+emap_sars
+```
+
+
+
+# Topology-based pathway analysis
+
+```{r, include=FALSE}
+name_res_0_60_keep_ashr <- res_0_60_keep_ashr_genes$gene[!grepl("^ENSG", res_0_60_keep_ashr_genes$gene)]
+
+gene_map <- AnnotationDbi::select(org.Hs.eg.db, 
+                                  keys = name_res_0_60_keep_ashr, 
+                                  columns = "ENSEMBL", 
+                                  keytype = "SYMBOL")
+
+name_to_ens_0_60_keep_ashr <- setNames(gene_map$ENSEMBL, gene_map$SYMBOL)
+
+res_0_60_keep_ashr_genes$gene <- ifelse(grepl("^ENSG", res_0_60_keep_ashr_genes$gene), 
+                                 res_0_60_keep_ashr_genes$gene, 
+                                 name_to_ens_0_60_keep_ashr[res_0_60_keep_ashr_genes$gene])
+
+res_0_60_keep_ashr_genes_dropna <- res_0_60_keep_ashr_genes %>% filter(!is.na(res_0_60_keep_ashr_genes$gene))
+
+res_0_60_keep_ashr_genes_dropna
+```
+
+
+```{r, include=FALSE}
+genes_entrez_sars <- getBM(filters = "ensembl_gene_id",
+             attributes = c("entrezgene_id", "ensembl_gene_id"),
+             values = res_0_60_keep_ashr_genes_dropna$gene,
+             mart = ensembl)
+
+genes_entrez_sars
+```
+
+
+```{r, include=FALSE}
+res_0_60_keep_ashr_genes_dropna <- dplyr::left_join(res_0_60_keep_ashr_genes_dropna, genes_entrez_sars, by = c("gene" = "ensembl_gene_id"))
+res_0_60_keep_ashr_genes_dropna
+```
+
+
+```{r, include=FALSE}
+logFC_sars <- res_0_60_keep_ashr_genes_dropna$log2FoldChange
+names(logFC_sars) <- res_0_60_keep_ashr_genes_dropna$entrezgene_id
+```
+
+
+```{r, include=FALSE}
+# KEGG: Cytokine-cytokine receptor interaction
+pathview(gene.data = logFC_sars, 
+         pathway.id = "hsa04060", 
+         species = "hsa", 
+         kegg.native = T)
+```
+
+
+## STRINGdb
+
+```{r, include=FALSE}
+string_db_human <- STRINGdb$new(version="11", species=9606, score_threshold=700, input_directory="")
+mapped_genes_sars <- string_db_human$map(res_0_60_keep_ashr_genes_dropna, "gene", removeUnmappedRows = TRUE)
+```
+
+
+```{r, include=FALSE}
+interactions_sars <- string_db_human$get_interactions(mapped_genes_sars$STRING_id)
+
+interactions_filtered_sars <- interactions_sars %>% filter(combined_score > 700)
+interactions_filtered_sars
+```
+
+
+```{r, echo=FALSE, include=FALSE}
+ensembl_protein_ids_sars <- gsub("^9606\\.", "", unique(c(interactions_filtered_sars$from, interactions_filtered_sars$to)))
+
+ensembl_to_symbol_sars <- getBM(attributes = c("ensembl_peptide_id", "external_gene_name"),
+                           filters = "ensembl_peptide_id", 
+                           values = ensembl_protein_ids_sars, 
+                           mart = ensembl)
+
+ensembl_to_symbol_sars$ensembl_peptide_id <- as.character(ensembl_to_symbol_sars$ensembl_peptide_id)
+interactions_filtered_sars$from <- as.character(interactions_filtered_sars$from)
+interactions_filtered_sars$to <- as.character(interactions_filtered_sars$to)
+
+interactions_filtered_sars$from <- gsub("^9606\\.", "", interactions_filtered_sars$from)
+interactions_filtered_sars$to <- gsub("^9606\\.", "", interactions_filtered_sars$to)
+
+interactions_filtered_sars_protein <- interactions_filtered_sars %>%
+  left_join(ensembl_to_symbol_sars, by = c("from" = "ensembl_peptide_id")) %>%
+  rename(from_symbol = external_gene_name) %>%
+  left_join(ensembl_to_symbol_sars, by = c("to" = "ensembl_peptide_id")) %>%
+  rename(to_symbol = external_gene_name)
+
+interactions_filtered_sars_protein <- interactions_filtered_sars_protein %>%
+  filter(!is.na(from_symbol) & !is.na(to_symbol))
+
+interactions_filtered_sars_protein <- interactions_filtered_sars_protein %>% dplyr::select("from_symbol", "to_symbol", "combined_score") %>% 
+  rename(from = "from_symbol", to = "to_symbol")
+
+interactions_filtered_sars_protein
+```
+
+
+```{r, include=FALSE}
+graph_sars <- graph_from_data_frame(d = interactions_filtered_sars_protein, directed = FALSE)
+graph_sars_simpl <- simplify(graph_sars)
+graph_sars_simpl
+```
+
+
+```{r, include=FALSE}
+graph_sars_simpl <- delete_vertices(graph_sars_simpl, V(graph_sars_simpl)[degree(graph_sars_simpl) < 2])
+subgraph_sars <- induced_subgraph(graph_sars_simpl, sample(V(graph_sars_simpl), 2000))
+subgraph_sars
+```
+
+```{r}
+communities_sars <- cluster_louvain(subgraph_sars)
+
+V(subgraph_sars)$community <- communities_sars$membership
+
+community_sizes_sars <- sizes(communities_sars)
+community_sizes_sars
+top_communities_sars <- order(community_sizes_sars, decreasing = TRUE)[1:3]
+top_communities_sars
+vertices_to_keep_sars <- V(subgraph_sars)[V(subgraph_sars)$community %in% top_communities_sars]
+
+subgraph_sars_new <- induced_subgraph(subgraph_sars, vertices_to_keep_sars)
+subgraph_sars_new
+```
+
+## Communities graph
+
+```{r}
+ggraph(subgraph_sars_new, layout = "kk") +
+  geom_edge_link(aes(edge_alpha = 0.5), show.legend = FALSE) +
+  geom_node_point(aes(color = factor(community)), size = 2) +
+  geom_node_text(aes(label = name), repel = TRUE, size = 2) +
+  theme_void()
+```
+
+```{r}
+genes_in_subgraph <- V(subgraph_sars_new)$name
+communities_in_subgraph <- V(subgraph_sars_new)$community
+
+community_genes_df <- data.frame(genes = genes_in_subgraph, community = communities_in_subgraph)
+
+genes_in_top_communities <- split(community_genes_df$genes, community_genes_df$community)
+```
+
+```{r}
+genes_in_top_communities[[1]]
+```
+
+
+```{r}
+genes_in_top_communities[[2]]
+```
+
+
+```{r}
+genes_in_top_communities[[3]]
+```
+
